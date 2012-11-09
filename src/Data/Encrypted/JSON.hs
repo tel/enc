@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, NamedFieldPuns #-}
 
 module Data.Encrypted.JSON where
 
@@ -18,17 +18,22 @@ import qualified Data.Text as T
 import           Data.Text.Encoding as E
 import           Data.Text.Lazy.Encoding as EL
 import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Base64.Lazy as LB64
 import           Data.Serialize (Serialize)
 import qualified Data.Serialize as S
 import qualified Data.ByteString.Base64 as B64
+import Codec.Compression.Zlib
 
-import Crypto.Classes
+import Crypto.Classes (BlockCipher)
 import Crypto.Modes
+import Crypto.Padding
 
 import Control.Lens hiding ((.=))
 import Control.Monad
 import Control.Applicative
 import Control.Error
+
+import Test.QuickCheck
 
 instance FromJSON UUID where
   parseJSON (String s) = justZ $ fromString $ T.unpack s
@@ -56,14 +61,13 @@ instance BlockCipher k => FromJSON (Key k) where
 
 instance BlockCipher k => ToJSON (Keybox k) where
   toJSON = toJSON
-           . M.mapKeys (EL.decodeUtf8 . toByteString)
+           . M.mapKeys (EL.decodeUtf8 . LB64.encode . toByteString)
            . M.map toJSON
            . getMap
 
--- GENERALLY we'd need a "traverse with key" or "traverse on the view
--- of pairs" solution here, since it's possible that parsing the
--- internal structure of the dictionary could fail.
-
+-- | Traverses on the map as a list, so it could be faster if it were
+-- in-place instead of having to deconstruct and rebuild the map
+-- through an intermediary
 instance BlockCipher k => FromJSON (Keybox k) where
   parseJSON = fmap (Keybox . M.fromList)
               . join
@@ -85,12 +89,62 @@ instance (FromJSON a, BlockCipher k) => FromJSON (Encrypted k a) where
     ivec    <- o .: "ivec" >>= serializableFromString
     keys    <- o .: "keys"
     payload <- o .: "payload" >>= serializableFromString
-    return Encrypted { _ivec = ivec,
-                       _keys = keys,
-                       _payload = payload }
+    return Encrypted { ivec = ivec,
+                       keys = keys,
+                       payload = payload }
 
 instance (ToJSON a, BlockCipher k) => ToJSON (Encrypted k a) where
-  toJSON e =
-    object [ "ivec"    .= (stringFromSerializable $ view ivec e),
-             "keys"    .= (toJSON $ view keys e),
-             "paylaod" .= (stringFromSerializable $ view payload e) ]
+  toJSON (Encrypted { ivec, keys, payload }) =
+    object [ "ivec"    .= (stringFromSerializable ivec),
+             "keys"    .= (toJSON keys),
+             "payload" .= (stringFromSerializable payload) ]
+
+-- | Encrypt with a single key, a downgraded, "normal" 'Encrypted' box
+encrypt :: (BlockCipher k, ToJSON a) =>
+           Key k -> IV k -> a -> Encrypted k a
+encrypt key iv a =
+  Encrypted { ivec = iv,
+              keys = Nothing,
+              payload = Payload $ fst $ cbc' (unKey key) iv s }
+  where s = padBlockSize (unKey key) $ B.concat $ L.toChunks $ compress $ encode a
+
+lockAway :: BlockCipher k => Key k -> Keycard k -> IV k -> Keybox k
+lockAway contentkey card@(Keycard { key, secret }) iv =
+  Keybox $ M.singleton key (encrypt secret iv contentkey)
+
+-- | Encrypt using a 'Keycard', storing the identity and the encrypted
+-- content key
+encryptAs :: (BlockCipher k, ToJSON a, FromJSON a) 
+             => Key k -> IV k      -- ^ The content key and its 'IV'
+             -> Keycard k -> IV k  -- ^ The 'Keycard' and its 'IV'
+             -> a -> Encrypted k a -- ^ An 'Encrypted' producer
+encryptAs contentkey ivcontent keycard ivcard a =
+  (encrypt contentkey ivcontent a) {
+    keys = Just $ lockAway contentkey keycard ivcontent
+    }
+
+addIdentity :: (BlockCipher k, ToJSON a)
+               => Keycard k                      -- ^ An authorized identity
+               -> Keycard k -> IV k              -- ^ The identity to add
+               -> Encrypted k a -> Encrypted k a -- ^ An 'Encrypted' transformer
+addIdentity = undefined
+
+-- Arbitrary instances
+
+-- | Newtype entirely to form the Arbitrary instance
+newtype Pair k = P { unPair ::  (Keycard k, Keybox k) }
+
+instance (BlockCipher k) => Arbitrary (Pair k) where
+  arbitrary = do
+    contentkey <- arbitrary
+    key        <- arbitrary
+    iv         <- arbitrary
+    uuid       <- arbitrary
+    let card = Keycard { key = uuid, secret = key }
+    return $ P (card, lockAway contentkey card iv)
+
+instance BlockCipher k => Arbitrary (Keycard k) where
+  arbitrary = fmap (fst . unPair) arbitrary
+
+instance BlockCipher k => Arbitrary (Keybox k) where
+  arbitrary = fmap (snd . unPair) arbitrary

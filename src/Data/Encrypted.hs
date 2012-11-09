@@ -1,10 +1,13 @@
-{-# LANGUAGE DeriveDataTypeable, TemplateHaskell, ExistentialQuantification #-}
+{-# LANGUAGE DeriveDataTypeable,
+             TemplateHaskell,
+             ExistentialQuantification #-}
 
 module Data.Encrypted where
 
 import Data.Data
 import Data.UUID
 import Data.Aeson
+import Data.Tagged
 import           Data.Map (Map)
 import qualified Data.Map as M
 import           Data.ByteString (ByteString)
@@ -47,14 +50,45 @@ instance Serialize Payload where
 newtype Keybox k = Keybox { getMap :: (Map UUID (Encrypted k (Key k))) }
                  deriving (Show, Eq, Data, Typeable)
 
+-- | TODO: Make these opaque but viable? Or remove the Data/Typeable
+-- instance of Encrypted
+instance Typeable (IV k) where
+  typeOf = undefined
+
+-- | TODO: Make these opaque but viable? Or remove the Data/Typeable
+-- instance of Encrypted
+instance Data (IV k) where
+  gunfold = undefined
+  toConstr = undefined
+  dataTypeOf = undefined
+
 -- | An encrypted wrapper around some polymorphic type acting as
 -- almost a 'Functor'
 data Encrypted k a =
-  Encrypted { _ivec    :: k,
-              _keys    :: Maybe (Keybox k),
-              _payload :: Payload }
+  Encrypted { ivec    :: IV k,
+              keys    :: Maybe (Keybox k),
+              payload :: Payload }
   deriving (Show, Eq, Data, Typeable)
-makeLenses ''Encrypted
 
-data Swipecard k = Swipecard { _key :: UUID, _secret :: k }
-makeLenses ''Swipecard
+data Keycard k = Keycard { key :: UUID, secret :: (Key k) }
+
+
+-- Arbitrary instances for testing
+
+-- | Lifts 'UUID's 'Random' instance
+instance Arbitrary UUID where
+  arbitrary = MkGen $ \g _ -> fst $ random g
+
+instance BlockCipher k => Arbitrary (IV k) where
+  arbitrary = do
+    ent <- vector $ unTagged (genSeedLength :: Tagged HashDRBG Int)
+    let Right g0 = newGen (B.pack ent)
+        Right (iv, _) = getIV (g0 :: HashDRBG)
+    return iv
+
+-- | NOT CRYPTOGRAPHICALLY SECURE!
+instance BlockCipher k => Arbitrary (Key k) where
+  arbitrary =
+    do let l = keyLength
+       Just k <- fmap (buildKey . B.pack) (vector $ untag $ l `div` 8)
+       return (Key $ asTaggedTypeOf k l)
