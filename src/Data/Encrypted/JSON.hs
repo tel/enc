@@ -7,12 +7,9 @@ import Data.Encrypted
 import Data.UUID
 import Data.Aeson
 import Data.Traversable
-import           Data.Map (Map)
 import qualified Data.Map as M hiding (keys)
-import           Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
-import qualified Data.ByteString.Lazy.Char8 as L8
 import           Data.Text (Text)
 import qualified Data.Text as T
 import           Data.Text.Encoding as E
@@ -21,16 +18,13 @@ import qualified Data.ByteString.Base64 as B64
 import qualified Data.ByteString.Base64.Lazy as LB64
 import           Data.Serialize (Serialize)
 import qualified Data.Serialize as S
-import qualified Data.ByteString.Base64 as B64
 import Codec.Compression.Zlib
 
 import Crypto.Classes (BlockCipher)
 import Crypto.Modes
 import Crypto.Padding
 
-import Control.Lens hiding ((.=))
 import Control.Monad
-import Control.Applicative
 import Control.Error
 
 import Test.QuickCheck
