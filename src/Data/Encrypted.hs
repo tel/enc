@@ -9,6 +9,7 @@ module Data.Encrypted (
 import Data.UUID
 import Data.Tagged
 import Data.Aeson
+import Data.Aeson.Types (Parser)
 import Data.Traversable
 import           Data.Map (Map)
 import qualified Data.Map as M hiding (keys)
@@ -87,6 +88,12 @@ encrypt key iv a =
               payload = Payload $ fst $ cbc' (unKey key) (unIvec iv) s }
   where s = padBlockSize (unKey key) $ B.concat $ L.toChunks $ compress $ encode a
 
+decrypt :: (BlockCipher k, FromJSON a) =>
+           Key k -> Encrypted k a -> Maybe a
+decrypt = undefined
+-- decrypt k (Encrypted { 
+--   where contentKey = 
+
 lockAway :: BlockCipher k => Key k -> Keycard k -> Ivec k -> Keybox k
 lockAway contentkey (Keycard { key, secret }) iv =
   Keybox $ M.singleton key (encrypt secret iv contentkey)
@@ -102,9 +109,17 @@ encryptAs contentkey ivcontent keycard ivcard a =
     keys = Just $ lockAway contentkey keycard ivcard
     }
 
+-- | Looks up the content key in the 'Keybox' of an 'Encrypted' box
+getContentKey :: BlockCipher k => Keycard k -> Encrypted k a -> Maybe (Key k)
+getContentKey (Keycard { key, secret }) (Encrypted { keys }) =
+  do Keybox map <- keys
+     enc <- M.lookup key map
+     decrypt secret enc
+     
+
 addIdentity :: (BlockCipher k, ToJSON a)
                => Keycard k                      -- ^ An authorized identity
-               -> Keycard k -> Ivec k              -- ^ The identity to add
+               -> Keycard k -> Ivec k            -- ^ The identity to add
                -> Encrypted k a -> Encrypted k a -- ^ An 'Encrypted' transformer
 addIdentity = undefined
 
@@ -148,11 +163,15 @@ instance BlockCipher k => ToJSON (Keybox k) where
 instance BlockCipher k => FromJSON (Keybox k) where
   parseJSON = fmap (Keybox . M.fromList)
               . join
-              . liftM (justZ . traverse doPair . M.toList)
+              . liftM (traverse doPair . M.toList)
               . parseJSON
 
-doPair :: BlockCipher k => (Text, Value) -> Maybe (Id, Encrypted k (Key k))
-doPair = undefined
+doPair :: (BlockCipher k) =>
+          (Text, Value) -> Parser (Id, Encrypted k (Key k))
+doPair (t, v) = do uuid <- justZ $ fromByteString $ L.fromChunks $ return $ E.encodeUtf8 t
+                   enc  <- parseJSON v
+                   return (Id uuid, enc)
+                   
 
 instance ToJSON Payload where
   toJSON = String . E.decodeUtf8 . B64.encode . getBytes
