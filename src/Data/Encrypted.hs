@@ -1,6 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable,
-             TemplateHaskell,
-             ExistentialQuantification,
+{-# LANGUAGE ExistentialQuantification,
              OverloadedStrings,
              NamedFieldPuns #-}
 
@@ -8,7 +6,6 @@ module Data.Encrypted (
   Encrypted (..),
   ) where
 
-import Data.Data
 import Data.UUID
 import Data.Tagged
 import Data.Aeson
@@ -41,23 +38,11 @@ import Codec.Compression.Zlib
 import Control.Monad
 import Control.Error
 
--- | TODO: Make these opaque but viable? Or remove the Data/Typeable
--- instance of Encrypted
-instance Typeable (IV k) where
-  typeOf = undefined
-
--- | TODO: Make these opaque but viable? Or remove the Data/Typeable
--- instance of Encrypted
-instance Data (IV k) where
-  gunfold = undefined
-  toConstr = undefined
-  dataTypeOf = undefined
-
 -- | A box for putting 'BlockCipher k's, useful for JSON encoding
-newtype Key k = Key { unKey :: k } deriving (Show, Eq, Data, Typeable)
+newtype Key k = Key { unKey :: k } deriving (Show, Eq)
 
 -- | A box for putting 'IV k's, useful for JSON encoding
-newtype Ivec k = Ivec { unIvec :: IV k } deriving (Show, Eq, Data, Typeable)
+newtype Ivec k = Ivec { unIvec :: IV k } deriving (Show, Eq)
 
 instance BlockCipher k => Serialize (Ivec k) where
   put = S.put . unIvec
@@ -66,7 +51,7 @@ instance BlockCipher k => Serialize (Ivec k) where
 -- | A little newtype wrapper for documentation purposes. It'll get
 -- stripped in compile and I doubt I'll even export it.
 newtype Payload = Payload { getBytes :: ByteString }
-                deriving (Show, Eq, Data, Typeable)
+                deriving (Show, Eq)
 
 -- | Passes through to the underlying 'ByteString'
 instance Serialize Payload where
@@ -74,12 +59,12 @@ instance Serialize Payload where
   get = fmap Payload S.get
 
 newtype Id = Id { toUUID :: UUID }
-           deriving (Show, Eq, Ord, Data, Typeable)
+           deriving (Show, Eq, Ord)
 
 -- | A keybox is a box of keys, or, less coyly, a mapping from (UUID,
 -- PersonalKey) space to the content key
 newtype Keybox k = Keybox { getMap :: Map Id (Encrypted k (Key k)) }
-                 deriving (Show, Eq, Data, Typeable)
+                 deriving (Show, Eq)
 
 -- | An encrypted wrapper around some polymorphic type acting as
 -- almost a 'Functor'
@@ -87,7 +72,7 @@ data Encrypted k a =
   Encrypted { ivec    :: Ivec k,
               keys    :: Maybe (Keybox k),
               payload :: Payload }
-  deriving (Show, Eq, Data, Typeable)
+  deriving (Show, Eq)
 
 data Keycard k = Keycard { key :: Id, secret :: Key k }
 
