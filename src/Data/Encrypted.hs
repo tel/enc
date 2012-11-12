@@ -43,8 +43,6 @@ module Data.Encrypted (
   Key (..), -- newKey
   ) where
 
-import System.Random
-
 import Data.Data
 import Data.UUID
 import Data.Tagged
@@ -141,8 +139,13 @@ data Encrypted k a =
 
 -- | Tries to decrypt a given 'Encrypted a' using any of the provided
 -- keys.
-tryDecrypt :: BlockCipher k => Encrypted k a -> Key k -> Maybe a
-tryDecrypt = undefined
+decrypt :: (FromJSON a, BlockCipher k) => Key k -> Encrypted k a -> Maybe a
+decrypt
+  (Key uuid key)
+  (Encrypted { ivec = Ivec iv, payload = Payload payload }) =
+    do msg <- unpadPKCS5safe out
+       decode $ decompress $ L.fromChunks [msg]
+  where (out, _) = unCbc' key iv payload
 
 {- $rationale
 
@@ -199,9 +202,9 @@ instance MonadTrans (EncryptT g k) where
 -- | Attempts to inject an 'Encrypted a' into the 'Encrypt' monad,
 -- using the first included key which can decrypt the value, but fails
 -- otherwise.
-fromEncrypted :: (BlockCipher k, Monad m, CryptoRandomGen g) =>
+fromEncrypted :: (BlockCipher k, Monad m, CryptoRandomGen g, FromJSON a) =>
                  Encrypted k a -> EncryptT g k m a
-fromEncrypted e = getKeys >>= justZ . fmap head . mapM (tryDecrypt e) 
+fromEncrypted e = getKeys >>= justZ . fmap head . mapM (flip decrypt e) 
 
 getKeys :: Monad m => EncryptT g k m [Key k]
 getKeys = do EncryptState _ g0 es <- EncryptT $ lift get
@@ -278,64 +281,18 @@ encrypt a = do contentIvec          <- newIvec
         makeKeymap keys encs = Keymap $ Right $ M.fromList $ zipWith go keys encs
         go :: Key k -> Encrypted k (Key k) -> (Id, Encrypted k (Key k))
         go (Key id _) e = (id, e)
-              
 
-
-
--- encrypt :: (BlockCipher k, Monad m, ToJSON a, CryptoRandomGen g)
---            => g -> EncryptT k m a -> m (Maybe (Encrypt k a))
--- encrypt = undefined
--- encrypt g ma =
---   where liftEncrypted = do a <- ma
-                           
-
--- encrypt :: (BlockCipher k, ToJSON a) => Key k -> a -> Encrypted k a
-
--- -- | Encrypt with a single key, a downgraded, "normal" 'Encrypted' box
--- encrypt :: (BlockCipher k, ToJSON a) =>
---            Key k -> Ivec k -> a -> Encrypted k a
--- encrypt key iv a =
---   Encrypted { ivec = iv,
---               keys = Nothing,
---               payload = Payload $ fst $ cbc' (unKey key) (unIvec iv) s }
---   where s = padBlockSize (unKey key) $ B.concat $ L.toChunks $ compress $ encode a
-
--- decrypt :: (BlockCipher k, FromJSON a) =>
---            Key k -> Encrypted k a -> Maybe a
--- decrypt = undefined
--- -- decrypt k (Encrypted { 
--- --   where contentKey = 
-
--- lockAway :: BlockCipher k => Key k -> Keycard k -> Ivec k -> Keybox k
--- lockAway contentkey (Keycard { key, secret }) iv =
---   Keybox $ M.singleton key (encrypt secret iv contentkey)
-
--- -- | Encrypt using a 'Keycard', storing the identity and the encrypted
--- -- content key
--- encryptAs :: (BlockCipher k, ToJSON a, FromJSON a) 
---              => Key k -> Ivec k      -- ^ The content key and its 'IV'
---              -> Keycard k -> Ivec k  -- ^ The 'Keycard' and its 'IV'
---              -> a -> Encrypted k a -- ^ An 'Encrypted' producer
--- encryptAs contentkey ivcontent keycard ivcard a =
---   (encrypt contentkey ivcontent a) {
---     keys = Just $ lockAway contentkey keycard ivcard
---     }
-
--- -- | Looks up the content key in the 'Keybox' of an 'Encrypted' box
--- getContentKey :: BlockCipher k => Keycard k -> Encrypted k a -> Maybe (Key k)
--- getContentKey (Keycard { key, secret }) (Encrypted { keys }) =
---   do Keybox map <- keys
---      enc <- M.lookup key map
---      decrypt secret enc
-     
-
--- addIdentity :: (BlockCipher k, ToJSON a)
---                => Keycard k                      -- ^ An authorized identity
---                -> Keycard k -> Ivec k            -- ^ The identity to add
---                -> Encrypted k a -> Encrypted k a -- ^ An 'Encrypted' transformer
--- addIdentity = undefined
-
-
+performEncryptT :: (CryptoRandomGen g, Monad m, MonadPlus m) =>
+                   StdGen -> g -> EncryptT g k m a -> m a
+performEncryptT sg rg (EncryptT m) =
+  evalStateT (runMaybeT m) (EncryptState sg rg M.empty) >>= justZ
+                          
+performEncryptTIO :: CryptoRandomGen g => EncryptT g k IO a -> IO a
+performEncryptTIO e =
+  do sg <- getStdGen
+     rg <- newGenIO
+     performEncryptT sg rg e
+                                   
 -- -- Serialization instances: JSON
 
 instance FromJSON Id where
