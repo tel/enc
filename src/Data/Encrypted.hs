@@ -1,6 +1,8 @@
 {-# LANGUAGE DeriveDataTypeable,
              GADTs,
              OverloadedStrings,
+             GeneralizedNewtypeDeriving,
+             Rank2Types,
              NamedFieldPuns #-}
 
 {- |
@@ -41,6 +43,8 @@ module Data.Encrypted (
   Key (..), -- newKey
   ) where
 
+import System.Random
+
 import Data.Data
 import Data.UUID
 import Data.Tagged
@@ -61,8 +65,8 @@ import qualified Data.ByteString.Base64.Lazy as LB64
 import           Data.Serialize (Serialize)
 import qualified Data.Serialize as S
 
-import Crypto.Random.DRBG
 import Crypto.Modes
+import Crypto.Random
 import Crypto.Classes hiding (encode)
 import Crypto.Padding
 
@@ -73,7 +77,9 @@ import System.Random
 import Codec.Compression.Zlib
 
 import Control.Monad
-import Control.Monad.Trans.Reader
+import Control.Monad.Identity
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.State
 import Control.Applicative
 import Control.Arrow
 import Control.Error
@@ -132,6 +138,156 @@ data Encrypted k a =
               keys    :: Keymap k,
               payload :: Payload k }
   deriving (Show, Eq)
+
+-- | Tries to decrypt a given 'Encrypted a' using any of the provided
+-- keys.
+tryDecrypt :: BlockCipher k => Encrypted k a -> Key k -> Maybe a
+tryDecrypt = undefined
+
+{- $rationale
+
+A completely pure encryption operation would have to look like
+
+> BlockCipher k => Key k -> IV k -> a -> Encrypted a
+
+but this is actually a little bit unsafe: how can we be sure that the
+initialization vector is being generated from a cryptographically
+secure random source? We'd have to do it outselves, really, so instead
+we have to wrap 'getIV' and do
+
+> (BlockCipher k, CryptoRandomGen g) =>
+> g -> Key k -> a -> (Encrypted a, g)
+
+which looks like a 'State' monad of some sort or another.
+
+To take it a step further, if we want to be able to lift functions via
+an 'Encrypted'-like functor, then we'll need some more information
+
+> liftE :: (BlockCipher k, CryptoRandomGen g) =>
+>          Key k -> (a -> b) -> (Encrypted a -> (Encrypted b, g))
+> liftE k f ~= encrypt k . f . decrypt k
+
+where the 'Key k' is used for both encryption and decryption in a
+'Reader'-like fashion.
+
+These two features basically beg a Monad instance, but what kind of
+monad is it?
+
+> x :: Encrypt AES256 Int
+> x = do addKey key
+>        addKey key
+>        removeKey key
+>        return 3
+> runEncryptIO x :: IO (Encrypted AES256 Int)
+> encode . runEncryptIO :: ToJSON a => Encrypt k a -> IO ByteString
+
+-}
+
+data EncryptState g k = EncryptState StdGen g (Map Id (Key k))
+
+-- | A monad transformer for building encryption pipelines and
+-- methods.
+newtype EncryptT g k m a =
+  EncryptT (MaybeT (StateT (EncryptState g k) m) a)
+  deriving (Functor, Applicative, Monad, MonadPlus)
+
+type EncryptG g k a = EncryptT g k Identity a
+
+instance MonadTrans (EncryptT g k) where
+  lift = EncryptT . lift . lift
+
+-- | Attempts to inject an 'Encrypted a' into the 'Encrypt' monad,
+-- using the first included key which can decrypt the value, but fails
+-- otherwise.
+fromEncrypted :: (BlockCipher k, Monad m, CryptoRandomGen g) =>
+                 Encrypted k a -> EncryptT g k m a
+fromEncrypted e = getKeys >>= justZ . fmap head . mapM (tryDecrypt e) 
+
+getKeys :: Monad m => EncryptT g k m [Key k]
+getKeys = do EncryptState _ g0 es <- EncryptT $ lift get
+             return (M.elems es)
+
+getEState :: Monad m => EncryptT g k m (EncryptState g k)
+getEState = EncryptT $ lift get
+
+putEState :: Monad m => EncryptState g k -> EncryptT g k m ()
+putEState s = EncryptT $ lift $ put s
+
+modCGen :: Monad m => (g -> Maybe (a, g)) -> EncryptT g k m a
+modCGen f = do EncryptState r g0 es <- getEState
+               case f g0 of
+                 Nothing -> nothing
+                 Just (a, g1) -> do
+                   putEState $ EncryptState r g1 es
+                   just a
+
+getNewCGen :: (Monad m, CryptoRandomGen g) => EncryptT g k m g
+getNewCGen = modCGen (rightMay . splitGen)
+
+modSGen :: Monad m => (StdGen -> (a, StdGen)) -> EncryptT g k m a
+modSGen f = do EncryptState r0 g es <- getEState
+               let (a, r1) = f r0
+               putEState (EncryptState r1 g es)
+               return a
+
+getNewSGen :: (Monad m) => EncryptT g k m StdGen
+getNewSGen = modSGen split
+
+just :: Monad m => a -> EncryptT g k m a
+just = EncryptT . return
+
+nothing :: Monad m => EncryptT g k m a
+nothing = EncryptT . MaybeT . return $ Nothing
+
+newIvec :: (Monad m, BlockCipher k, CryptoRandomGen g) => EncryptT g k m (Ivec k)
+newIvec = getNewCGen >>= rightZ . fmap (Ivec . fst) . getIV
+
+-- | Creates a new cryptographic key
+newKey :: (CryptoRandomGen g, BlockCipher k, Monad m) => EncryptT g k m (Key k)
+newKey = do let len = keyLength
+            k    <- modCGen (rightMay . genBytes (untag len)) >>= justZ . buildKey
+            uuid <- modSGen random
+            return (Key (Id uuid) (k `asTaggedTypeOf` len))
+
+-- | Encrypt a value outside of an 'Encrypt' context
+encrypt' :: (BlockCipher k, ToJSON a) => Key k -> Ivec k -> a -> Payload k
+encrypt' (Key id k) (Ivec iv) a = Payload $ fst $ cbc' k iv bytes
+  where bytes = padBlockSize k $ mconcat $ L.toChunks $ compress $ encode a
+
+-- | Encrypt a value in the current 'Encrypt' context using a single
+-- particular key
+encryptOnce :: (BlockCipher k, Monad m, ToJSON a, CryptoRandomGen g) =>
+               a -> Key k -> EncryptT g k m (Encrypted k a)
+encryptOnce a key@(Key id k) =
+  do ivec@(Ivec iv) <- newIvec
+     return Encrypted { ivec    = ivec,
+                        keys    = Keymap (Left id),
+                        payload = encrypt' key ivec a }
+
+-- | Encrypt a value in the current 'Encrypt' context
+encrypt :: (ToJSON a, BlockCipher k, Monad m, CryptoRandomGen g) =>
+           a -> EncryptT g k m (Encrypted k a)
+encrypt a = do contentIvec          <- newIvec
+               contentKey           <- newKey
+               keys                 <- getKeys
+               encryptedContentKeys <- mapM (encryptOnce contentKey) keys
+               return Encrypted { ivec    = contentIvec,
+                                  keys    = makeKeymap keys encryptedContentKeys,
+                                  payload = encrypt' contentKey contentIvec a }
+  where makeKeymap :: [Key k] -> [Encrypted k (Key k)] -> Keymap k
+        makeKeymap keys encs = Keymap $ Right $ M.fromList $ zipWith go keys encs
+        go :: Key k -> Encrypted k (Key k) -> (Id, Encrypted k (Key k))
+        go (Key id _) e = (id, e)
+              
+
+
+
+-- encrypt :: (BlockCipher k, Monad m, ToJSON a, CryptoRandomGen g)
+--            => g -> EncryptT k m a -> m (Maybe (Encrypt k a))
+-- encrypt = undefined
+-- encrypt g ma =
+--   where liftEncrypted = do a <- ma
+                           
 
 -- encrypt :: (BlockCipher k, ToJSON a) => Key k -> a -> Encrypted k a
 
