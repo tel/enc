@@ -1,8 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable,
-             GADTs,
+ScopedTypeVariables,
              OverloadedStrings,
              GeneralizedNewtypeDeriving,
-             Rank2Types,
              NamedFieldPuns #-}
 
 {- |
@@ -43,11 +42,15 @@ module Data.Encrypted (
   Key (..), -- newKey
   ) where
 
+import Crypto.Cipher.AES.Haskell (AES256)
+import Debug.Trace
+
 import Data.Data
 import Data.UUID
 import Data.Tagged
 import Data.Aeson
 import Data.Monoid
+import Data.Maybe (fromJust)
 import Data.Aeson.Types (Parser)
 import           Data.Map (Map)
 import qualified Data.Map as M hiding (keys)
@@ -64,7 +67,7 @@ import           Data.Serialize (Serialize)
 import qualified Data.Serialize as S
 
 import Crypto.Modes
-import Crypto.Random
+import Crypto.Random.DRBG
 import Crypto.Classes hiding (encode)
 import Crypto.Padding
 
@@ -194,7 +197,9 @@ newtype EncryptT g k m a =
   EncryptT (MaybeT (StateT (EncryptState g k) m) a)
   deriving (Functor, Applicative, Monad, MonadPlus)
 
-type EncryptG g k a = EncryptT g k Identity a
+type EncryptG g k a = EncryptT g k IO a
+
+type Encrypt k a = EncryptG HashDRBG k a
 
 instance MonadTrans (EncryptT g k) where
   lift = EncryptT . lift . lift
@@ -204,11 +209,16 @@ instance MonadTrans (EncryptT g k) where
 -- otherwise.
 fromEncrypted :: (BlockCipher k, Monad m, CryptoRandomGen g, FromJSON a) =>
                  Encrypted k a -> EncryptT g k m a
-fromEncrypted e = getKeys >>= justZ . fmap head . mapM (flip decrypt e) 
+fromEncrypted e = getKeys >>= justZ . fmap head . mapM (`decrypt` e) 
 
 getKeys :: Monad m => EncryptT g k m [Key k]
-getKeys = do EncryptState _ g0 es <- EncryptT $ lift get
+getKeys = do EncryptState _ g0 es <- getEState
              return (M.elems es)
+
+addKey :: Monad m => Key k -> EncryptT g k m ()
+addKey k@(Key uuid _) =
+  do EncryptState s g es <- getEState
+     putEState (EncryptState s g $ M.insert uuid k es)
 
 getEState :: Monad m => EncryptT g k m (EncryptState g k)
 getEState = EncryptT $ lift get
@@ -248,9 +258,10 @@ newIvec = getNewCGen >>= rightZ . fmap (Ivec . fst) . getIV
 -- | Creates a new cryptographic key
 newKey :: (CryptoRandomGen g, BlockCipher k, Monad m) => EncryptT g k m (Key k)
 newKey = do let len = keyLength
-            k    <- modCGen (rightMay . genBytes (untag len)) >>= justZ . buildKey
-            uuid <- modSGen random
-            return (Key (Id uuid) (k `asTaggedTypeOf` len))
+            bytes <- modCGen (rightMay . genBytes (untag len `div` 8))
+            key   <- justZ $ buildKey bytes
+            uuid  <- modSGen random
+            return (Key (Id uuid) (key `asTaggedTypeOf` len))
 
 -- | Encrypt a value outside of an 'Encrypt' context
 encrypt' :: (BlockCipher k, ToJSON a) => Key k -> Ivec k -> a -> Payload k
@@ -293,7 +304,7 @@ performEncryptTIO e =
      rg <- newGenIO
      performEncryptT sg rg e
                                    
--- -- Serialization instances: JSON
+-- Serialization instances: JSON
 
 instance FromJSON Id where
   parseJSON (String s) = fmap Id $ justZ $ fromString $ T.unpack s
@@ -380,38 +391,36 @@ instance (FromJSON a, BlockCipher k) => FromJSON (Encrypted k a) where
 
 -- -- Arbitrary instances
 
--- -- | Newtype entirely to form the Arbitrary instance
--- newtype Pair k = P (Key k, Keymap k)
+genDRBG :: Gen HashDRBG
+genDRBG = do ent <- vector $ unTagged (genSeedLength :: Tagged HashDRBG Int)
+             let Right g = newGen (B.pack ent)
+             return g
 
--- instance (BlockCipher k) => Arbitrary (Pair k) where
---   arbitrary = do
---     contentkey <- arbitrary
---     key        <- arbitrary
---     iv         <- arbitrary
---     uuid       <- arbitrary
---     let keyType = Key (Id uuid) key
---     return $ P (keyType, lockAway contentkey keyType iv)
+performEncryptGen :: MonadPlus m => EncryptT HashDRBG k m a -> Gen (m a)
+performEncryptGen m = do sg <- MkGen (\s _ -> s)
+                         rg <- genDRBG
+                         return $ performEncryptT sg rg m
 
--- instance BlockCipher k => Arbitrary (Key k) where
---   arbitrary = fmap (fst . unPair) arbitrary
+-- | Newtype entirely to form the Arbitrary instance
+newtype Pair k a = P { unPair :: (Key k, Encrypted k a) }
 
--- instance BlockCipher k => Arbitrary (Keybox k) where
---   arbitrary = fmap (snd . unPair) arbitrary
+instance (BlockCipher k, Arbitrary a, ToJSON a) => Arbitrary (Pair k a) where
+  arbitrary = do a  <- arbitrary
+                 fmap fromJust $ performEncryptGen (mkpair a)
+    where mkpair a = do key <- newKey
+                        addKey key
+                        enc <- encrypt a
+                        return $ P (key, enc)
 
--- -- | Lifts 'UUID's 'Random' instance
--- instance Arbitrary Id where
---   arbitrary = MkGen $ \g _ -> Id $ fst $ random g
+instance BlockCipher k => Arbitrary (Key k) where
+  arbitrary = fmap fromJust $ performEncryptGen newKey
 
--- instance BlockCipher k => Arbitrary (Ivec k) where
---   arbitrary = do
---     ent <- vector $ unTagged (genSeedLength :: Tagged HashDRBG Int)
---     let Right g0 = newGen (B.pack ent)
---         Right (iv, _) = getIV (g0 :: HashDRBG)
---     return (Ivec iv)
+instance (BlockCipher k, Arbitrary a, ToJSON a) => Arbitrary (Encrypted k a) where
+  arbitrary = fmap (snd . unPair) arbitrary
 
--- -- | NOT CRYPTOGRAPHICALLY SECURE!
--- instance BlockCipher k => Arbitrary (Key k) where
---   arbitrary =
---     do let l = keyLength
---        Just k <- fmap (buildKey . B.pack) (vector $ untag $ l `div` 8)
---        return (Key $ asTaggedTypeOf k l)
+-- | Lifts 'UUID's 'Random' instance
+instance Arbitrary Id where
+  arbitrary = MkGen $ \g _ -> Id $ fst $ random g
+
+instance BlockCipher k => Arbitrary (Ivec k) where
+  arbitrary = fmap fromJust $ performEncryptGen newIvec
