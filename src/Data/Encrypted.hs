@@ -1,5 +1,5 @@
 {-# LANGUAGE DeriveDataTypeable,
-ScopedTypeVariables,
+             DeriveGeneric,
              OverloadedStrings,
              GeneralizedNewtypeDeriving,
              NamedFieldPuns #-}
@@ -39,9 +39,20 @@ although the actual computation must be delayed until a valid key
 
 module Data.Encrypted (
   -- Encrypted (..),
-  Key (..), -- newKey
+  Key (..), 
+  Ivec (..),
+  Encrypted (..),
+  Keymap (..),
+  Payload (..),
+  Id (..),
+  fromEncrypted, decrypt,
+  addKey, getKeys, newKey, newIvec,
+  encrypt, encryptOnce,
+  EncryptT, EncryptG, Encrypt,
+  performEncryptT, performEncryptTIO
   ) where
 
+import GHC.Generics
 import Crypto.Cipher.AES.Haskell (AES256)
 import Debug.Trace
 
@@ -56,10 +67,12 @@ import           Data.Map (Map)
 import qualified Data.Map as M hiding (keys)
 import           Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Lazy as TL
 import           Data.Text.Encoding as E
 import           Data.Text.Lazy.Encoding as EL
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Base64 as B64
 import qualified Data.ByteString.Base64.Lazy as LB64
@@ -100,11 +113,21 @@ instance Serialize Id where
 -- both for providing custom instances on the 'k' type without using
 -- XUndeciableInstances and XOverlappingInstances and also allows us
 -- to give a 'UUID' name to every key.
-data Key k = Key Id k deriving (Show, Eq, Data, Typeable)
+data Key k = Key Id k deriving (Data, Typeable)
+
+instance Serialize k => Show (Key k) where
+  show (Key (Id uuid) k) =
+    "Key " ++ show uuid ++ " ::: " ++ B8.unpack (B64.encode (S.encode k))
+
+instance BlockCipher k => Eq (Key k) where
+  (Key idA kA) == (Key idB kB) = S.encode kA == S.encode kB
 
 -- | A box for putting 'IV k's, needed to derive encoding classes
 -- without using XOverlappingInstances.
-newtype Ivec k = Ivec (IV k) deriving (Show, Eq)
+newtype Ivec k = Ivec (IV k) deriving Eq
+
+instance BlockCipher k => Show (Ivec k) where
+  show (Ivec iv) = "Ivec " ++ B8.unpack (B64.encode (S.encode iv))
 
 instance BlockCipher k => Serialize (Ivec k) where
   put (Ivec iv) = S.put iv
@@ -143,12 +166,8 @@ data Encrypted k a =
 -- | Tries to decrypt a given 'Encrypted a' using any of the provided
 -- keys.
 decrypt :: (FromJSON a, BlockCipher k) => Key k -> Encrypted k a -> Maybe a
-decrypt
-  (Key uuid key)
-  (Encrypted { ivec = Ivec iv, payload = Payload payload }) =
-    do msg <- unpadPKCS5safe out
-       decode $ decompress $ L.fromChunks [msg]
-  where (out, _) = unCbc' key iv payload
+decrypt k
+  (Encrypted { ivec = iv, payload = payload }) = decrypt' k iv payload
 
 {- $rationale
 
@@ -268,6 +287,13 @@ encrypt' :: (BlockCipher k, ToJSON a) => Key k -> Ivec k -> a -> Payload k
 encrypt' (Key id k) (Ivec iv) a = Payload $ fst $ cbc' k iv bytes
   where bytes = padBlockSize k $ mconcat $ L.toChunks $ compress $ encode a
 
+decrypt' :: (BlockCipher k, FromJSON a) =>
+            Key k -> Ivec k -> Payload k -> Maybe a
+decrypt' (Key id k) (Ivec iv) (Payload bs) =
+  do msg <- unpadPKCS5safe out
+     decode $ decompress $ L.fromChunks [msg]  
+  where (out, _) = unCbc' k iv bs
+
 -- | Encrypt a value in the current 'Encrypt' context using a single
 -- particular key
 encryptOnce :: (BlockCipher k, Monad m, ToJSON a, CryptoRandomGen g) =>
@@ -327,18 +353,24 @@ instance BlockCipher k => ToJSON (Key k) where
   toJSON (Key id k) = object ["key" .= (String $ textFromSerializable k),
                               "id"  .= toJSON id]
 
+instance BlockCipher k => FromJSON (Key k) where
+  parseJSON (Object o) = do
+    key <- (o .: "key") >>= serializableFromText
+    id  <- o .: "id"
+    return (Key id key)
+
+instance BlockCipher k => ToJSON (Ivec k) where
+  toJSON (Ivec iv) = String $ textFromSerializable iv
+
+instance BlockCipher k => FromJSON (Ivec k) where
+  parseJSON (String s) = serializableFromText s
+
 instance BlockCipher k => ToJSON (Payload k) where
   toJSON (Payload bs) = String . E.decodeUtf8 . B64.encode $ bs
 
 instance BlockCipher k => FromJSON (Payload k) where
   parseJSON (String s) = fmap Payload $ rightZ $ B64.decode $ E.encodeUtf8 s
   parseJSON _          = fail "parse: Data.Encrypted.JSON Payload"
-
-instance BlockCipher k => FromJSON (Key k) where
-  parseJSON (Object o) = do
-    key <- (o .: "key") >>= serializableFromText
-    id  <- o .: "id"
-    return (Key id key)
 
 instance BlockCipher k => ToJSON (Keymap k) where
   toJSON (Keymap (Left id)) =
@@ -347,8 +379,8 @@ instance BlockCipher k => ToJSON (Keymap k) where
     where pairs :: BlockCipher k => Map Id (Encrypted k (Key k)) -> [(Text, Value)]
           pairs = map (toText *** toJSON) . M.toList
           toText :: Id -> Text
-          toText = textFromSerializable
-
+          toText id = let (String s) = toJSON id in s
+          
 -- | Traverses on the map as a list, so it could be faster if it were
 -- in-place instead of having to deconstruct and rebuild the map
 -- through an intermediary
@@ -370,7 +402,9 @@ instance BlockCipher k => FromJSON (Keymap k) where
             return $ Keymap $ Right $ M.fromList pairs
             where doKey :: BlockCipher k =>
                            Kleisli Parser (Text, Value) (Id, Encrypted k (Key k))
-                  doKey = Kleisli serializableFromText *** Kleisli parseJSON
+                  doKey = Kleisli (parseJSON . String)
+                          ***
+                          Kleisli parseJSON
 
 instance (ToJSON a, BlockCipher k) => ToJSON (Encrypted k a) where
   toJSON (Encrypted { ivec, keys, payload }) =
@@ -415,6 +449,12 @@ instance (BlockCipher k, Arbitrary a, ToJSON a) => Arbitrary (Pair k a) where
 instance BlockCipher k => Arbitrary (Key k) where
   arbitrary = fmap fromJust $ performEncryptGen newKey
 
+instance BlockCipher k => Arbitrary (Ivec k) where
+  arbitrary = fmap fromJust $ performEncryptGen newIvec
+
+instance BlockCipher k => Arbitrary (Payload k) where
+  arbitrary = fmap (Payload . B8.pack) arbitrary
+
 instance (BlockCipher k, Arbitrary a, ToJSON a) => Arbitrary (Encrypted k a) where
   arbitrary = fmap (snd . unPair) arbitrary
 
@@ -422,5 +462,45 @@ instance (BlockCipher k, Arbitrary a, ToJSON a) => Arbitrary (Encrypted k a) whe
 instance Arbitrary Id where
   arbitrary = MkGen $ \g _ -> Id $ fst $ random g
 
-instance BlockCipher k => Arbitrary (Ivec k) where
-  arbitrary = fmap fromJust $ performEncryptGen newIvec
+--- Tests
+
+data Wrapper a = Wrapper { unWrap :: a } deriving (Show, Eq, Generic)
+
+instance Arbitrary a => Arbitrary (Wrapper a) where
+  arbitrary = fmap Wrapper arbitrary
+
+instance ToJSON a => ToJSON (Wrapper a)
+instance FromJSON a => FromJSON (Wrapper a)
+
+prop_jsonCanDecode :: (FromJSON a, ToJSON a, Eq a) => a -> a -> Bool
+prop_jsonCanDecode witness a =
+  case decode (encode $ Wrapper $ a `asTypeOf` witness) of
+    Nothing          -> False
+    Just (Wrapper b) -> (b `asTypeOf` a) `seq` True
+
+prop_encryptLeftIso' :: (ToJSON a, FromJSON a, Eq a, BlockCipher k)
+                        => k -> a -> Key k -> Ivec k -> a -> Bool
+prop_encryptLeftIso' keyWitness aWitness key iv a =
+  case decrypt' key iv (encrypt' key iv a) of
+    Nothing -> False
+    Just b  -> a == b
+
+prop_encryptLeftIso :: (ToJSON a, FromJSON a, Eq a, BlockCipher k)
+                        => k -> a -> a -> Gen Bool
+prop_encryptLeftIso keyWitness aWitness a =
+  fmap justBool . performEncryptGen $
+  do key@(Key _ k) <- newKey
+     let _ = k `asTypeOf` keyWitness
+     addKey key
+     e <- encrypt a
+     b <- fromEncrypted e
+     return (b == a)
+  where justBool Nothing  = False
+        justBool (Just b) = b
+
+-- * Encrypted k a FAILS this, thus we can't even test encryption
+prop_jsonLeftIso :: (FromJSON a, ToJSON a, Eq a) => a -> a -> Bool
+prop_jsonLeftIso witness a =
+  case decode (encode $ Wrapper $ a `asTypeOf` witness) of
+    Nothing          -> False
+    Just (Wrapper b) -> a == b
