@@ -1,468 +1,329 @@
 {-# LANGUAGE DeriveDataTypeable,
              DeriveGeneric,
-             OverloadedStrings,
              GeneralizedNewtypeDeriving,
-             NamedFieldPuns #-}
+             OverloadedStrings #-}
 
 {- |
 Module      : $Header$
-Description : Encryption-as-functor, high-level encryption primitives
-              wrapped around serialization
+
+Description : Encryption as functor. A typesafe way to use NaCl's
+              high-level secret key cryptosystem.
+
 Copyright   : (c) 2012 Joseph Abrahamson
 License     : MIT
 Maintainer  : Joseph Abrahamson <me@jspha.com>
-Stability   : unstable
+Stability   : experimental
 Portability : non-portable
-
-Most encryption libraries are intentionally very low-level with types
-such as
-
-> encrypt key :: ByteString -> ByteString
-
-but, Data.Encrypted lifts this raw operation up into a typesafe one
-
-> encrypt key :: Serialize a => a -> Encrypted a
-
-(though, for my own purposes, I'm originally building it around Aeson,
-so instead of a 'Serialize' instance we need a 'ToJSON' instance)
-
-This typesafe encryption makes Encrypted into a kind of indexed
-functor enabling pseudo-Homomorphic Encryption via lifting
-
-> f :: a -> b
-> liftM f :: Encrypted a -> Encrypted b
-
-although the actual computation must be delayed until a valid key
-(index) is provided.
 
 -}
 
 module Data.Encrypted (
-  -- Encrypted (..),
-  Key (..), 
-  Ivec (..),
+  Id        (..),
+  Key       (..),
+  Nonce     (..),
+  Ownership (..),
   Encrypted (..),
-  Keymap (..),
-  Payload (..),
-  Id (..),
-  fromEncrypted, decrypt,
-  addKey, getKeys, newKey, newIvec,
-  encrypt, encryptOnce,
-  EncryptT, EncryptG, Encrypt,
-  performEncryptT, performEncryptTIO
+  EncryptT, performEncrypt, performEncrypt',
+  Encrypt,
+  fromEncrypted,
+  newKey, getKeys,
+  addKey, removeKey, removeKeyById,
+  encrypt, encryptMulti, decrypt
   ) where
 
-import GHC.Generics
-import Crypto.Cipher.AES.Haskell (AES256)
-import Debug.Trace
-
-import Data.Data
 import Data.UUID
-import Data.Tagged
 import Data.Aeson
+import Data.Tagged
+import Data.Maybe
 import Data.Monoid
-import Data.Maybe (fromJust)
-import Data.Aeson.Types (Parser)
-import           Data.Map (Map)
-import qualified Data.Map as M hiding (keys)
+import Data.List
 import           Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Lazy as TL
-import           Data.Text.Encoding as E
-import           Data.Text.Lazy.Encoding as EL
+import qualified Data.Text.Encoding as TE
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
-import qualified Data.ByteString.Lazy as L
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Base64 as B64
-import qualified Data.ByteString.Base64.Lazy as LB64
-import           Data.Serialize (Serialize)
-import qualified Data.Serialize as S
 
-import Crypto.Modes
-import Crypto.Random.DRBG
-import Crypto.Classes hiding (encode)
-import Crypto.Padding
+import GHC.Generics
+import Data.Data
 
-import Test.QuickCheck
-import Test.QuickCheck.Gen
-import System.Random
+import Crypto.NaCl.Key
+import Crypto.NaCl.Random
+import qualified Crypto.NaCl.Internal as SaltI
+import qualified Crypto.NaCl.Encrypt.SecretKey as SK
 
-import Codec.Compression.Zlib
-
-import Control.Monad
-import Control.Monad.Identity
-import Control.Monad.Trans.Class
-import Control.Monad.Trans.State
+import Control.Error
 import Control.Applicative
 import Control.Arrow
-import Control.Error
+import Control.Monad
+import Control.Monad.IO.Class
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.State
+import Control.Monad.Trans.Error
 
--- | A newtype wrapper around 'UUID' since we need some new instances
--- not available in the raw type.
-newtype Id = Id UUID
-           deriving (Show, Eq, Ord, Data, Typeable)
+import System.Random
+import Test.QuickCheck
+import Test.QuickCheck.Gen
 
-instance Serialize Id where
-  put (Id iv) = S.putByteString $ mconcat $ L.toChunks $ toByteString iv
-  get = fmap (L.fromChunks . return) S.get
-        >>= fmap Id . justZ . fromByteString
+-- | 'Id's are encryption identities, wrappers around random
+-- "Data.UUID.UUID" which helps for Serialization purposes.
+newtype Id = Id { unId :: UUID } deriving (Eq, Ord, Data, Typeable, Generic)
 
--- | Keys are always lifted from the raw crypto-api @forall
--- k. BlockCipher k => k@ up into a new 'Key' container. It's useful
--- both for providing custom instances on the 'k' type without using
--- XUndeciableInstances and XOverlappingInstances and also allows us
--- to give a 'UUID' name to every key.
-data Key k = Key Id k deriving (Data, Typeable)
+instance Show Id where
+  show (Id {unId = uuid}) = "Id " ++ show uuid
 
-instance Serialize k => Show (Key k) where
-  show (Key (Id uuid) k) =
-    "Key " ++ show uuid ++ " ::: " ++ B8.unpack (B64.encode (S.encode k))
+-- | 'UUID's are serialized directly, but since we known the UUID
+-- character set is valid ASCII, it's safe to just directly encode it
+instance ToJSON Id where
+  toJSON = String . T.pack . toString . unId
 
-instance BlockCipher k => Eq (Key k) where
-  (Key idA kA) == (Key idB kB) = S.encode kA == S.encode kB
+-- | 'UUID's are deserialized directly. Similar to the 'ToJSON'
+-- instance, we assume the character set is fine and encode directly.
+instance FromJSON Id where
+  parseJSON (String t) =
+    justZ . fmap Id . fromString . T.unpack $ t
+  parseJSON _ = mzero
 
--- | A box for putting 'IV k's, needed to derive encoding classes
--- without using XOverlappingInstances.
-newtype Ivec k = Ivec (IV k) deriving Eq
+-- | Lifts the 'Random UUID' instance
+instance Arbitrary Id where
+  arbitrary = fmap Id $ MkGen $ \g _ -> fst (random g)
 
-instance BlockCipher k => Show (Ivec k) where
-  show (Ivec iv) = "Ivec " ++ B8.unpack (B64.encode (S.encode iv))
 
-instance BlockCipher k => Serialize (Ivec k) where
-  put (Ivec iv) = S.put iv
-  get = fmap Ivec S.get
 
--- | A wrapper around the raw 'ByteString' serializations inside of an
--- 'Encrypted' box. Again, useful for writing encoding instances, but
--- it also has a phantom type tracking the encryption scheme used to
--- create it.
-newtype Payload k = Payload ByteString
-                deriving (Show, Eq, Data, Typeable)
+data Key = Key { key :: SecretKey, identity :: Id }
+           deriving (Eq, Typeable, Generic)
 
--- | Passes through to the underlying 'ByteString'
--- transparently---there is no trace of the wrapper once serialized.
-instance BlockCipher k => Serialize (Payload k) where
-  put (Payload bs) = S.put bs
-  get = fmap Payload S.get
+instance Show Key where
+  showsPrec p (Key { identity = i }) =
+    showParen (p>0) $
+    showString $ "Key {key = <<elided>>, identity = " ++ show i ++ "}"
 
--- | A 'Keymap' is a certificate noting what keys are able to decrypt
--- this particular encrypted box. They come in two forms, either a
--- single certificate (the 'Left' side) or a mapping from 'Id' to
--- 'Encrypted k (Key k)' which indicates that the content key is
--- stored in many different 'Encrypted' categories, each one indexed
--- by a particular 'Id => Key k'.
-data Keymap k = Keymap (Either Id (Map Id (Encrypted k (Key k))))
-                deriving (Show, Eq)
+b64text :: ByteString -> Text
+b64text = TE.decodeUtf8 . B64.encode
 
--- | An (almost) indexed functor into the 'Encrypted a'
--- category. There are two kinds of encrypted 
-data Encrypted k a =
-  Encrypted { ivec    :: Ivec k,
-              keys    :: Keymap k,
-              payload :: Payload k }
-  deriving (Show, Eq)
+unb64text :: Text -> Maybe ByteString
+unb64text = rightMay . B64.decode . TE.encodeUtf8
 
--- | Tries to decrypt a given 'Encrypted a' using any of the provided
--- keys.
-decrypt :: (FromJSON a, BlockCipher k) => Key k -> Encrypted k a -> Maybe a
-decrypt k
-  (Encrypted { ivec = iv, payload = payload }) = decrypt' k iv payload
+instance ToJSON Key where
+  toJSON (Key { key = SecretKey kbs, identity = i }) =
+    object ["key"      .= String (b64text kbs),
+            "identity" .= toJSON i]
+            
+instance FromJSON Key where
+  parseJSON (Object o) =
+    do i            <- o .: "identity"
+       (String ktx) <- o .: "key"
+       kbs          <- justZ $ unb64text ktx
+       return Key { key = SecretKey kbs, identity = i }
+  parseJSON _ = mzero
 
-{- $rationale
+-- | WARNING For testing only! This does not produce cryptographically
+-- random keys!
+instance Arbitrary Key where
+  arbitrary = do k <- fmap (SecretKey . B.pack) $ vector SK.keyLength
+                 i <- arbitrary
+                 return Key { key = k, identity = i }
 
-A completely pure encryption operation would have to look like
+-- | A newtype wrapper around 'SK.SKNonce' for serialization
+newtype Nonce = Nonce SK.SKNonce deriving (Eq, Typeable, Generic)
 
-> BlockCipher k => Key k -> IV k -> a -> Encrypted a
+instance Show Nonce where
+  showsPrec p (Nonce sk) =
+    showParen (p>0) $
+    showString (B8.unpack $ "Nonce " <> B64.encode (SaltI.toBS sk))
 
-but this is actually a little bit unsafe: how can we be sure that the
-initialization vector is being generated from a cryptographically
-secure random source? We'd have to do it outselves, really, so instead
-we have to wrap 'getIV' and do
+-- | Lift the internal 'Nonce' API up to 'Nonce'
+instance SaltI.Nonce Nonce where
+  size = retag (SaltI.size :: Tagged SK.SKNonce Int)
+  toBS (Nonce n) = SaltI.toBS n
+  fromBS bs = fmap Nonce $ SaltI.fromBS bs
+  createZeroNonce = Nonce SaltI.createZeroNonce
+  createRandomNonce = fmap Nonce SaltI.createRandomNonce
+  incNonce (Nonce n) = Nonce (SaltI.incNonce n)
 
-> (BlockCipher k, CryptoRandomGen g) =>
-> g -> Key k -> a -> (Encrypted a, g)
+instance ToJSON Nonce where
+  toJSON (Nonce n) = String . b64text $ SaltI.toBS n
 
-which looks like a 'State' monad of some sort or another.
+instance FromJSON Nonce where
+  parseJSON (String t) = justZ $ SaltI.fromBS <=< unb64text $ t
+  parseJSON _ = mzero
 
-To take it a step further, if we want to be able to lift functions via
-an 'Encrypted'-like functor, then we'll need some more information
+instance Arbitrary Nonce where
+  arbitrary =
+    do let size = SaltI.size
+       n <- fmap (fromJust . SaltI.fromBS . B.pack) (vector $ untag size)
+       return (n `asTaggedTypeOf` size)
 
-> liftE :: (BlockCipher k, CryptoRandomGen g) =>
->          Key k -> (a -> b) -> (Encrypted a -> (Encrypted b, g))
-> liftE k f ~= encrypt k . f . decrypt k
+-- | Strict JSON encode
+encodeS :: ToJSON a => a -> ByteString
+encodeS = mconcat . BL.toChunks . encode
 
-where the 'Key k' is used for both encryption and decryption in a
-'Reader'-like fashion.
+-- | Strict JSON decode
+decodeS :: FromJSON a => ByteString -> Maybe a
+decodeS = decode . BL.fromChunks . return
 
-These two features basically beg a Monad instance, but what kind of
-monad is it?
+data Ownership = Single Id | Multi [Encrypted Key]
+               deriving (Show, Eq, Typeable, Generic)
 
-> x :: Encrypt AES256 Int
-> x = do addKey key
->        addKey key
->        removeKey key
->        return 3
-> runEncryptIO x :: IO (Encrypted AES256 Int)
-> encode . runEncryptIO :: ToJSON a => Encrypt k a -> IO ByteString
+instance ToJSON Ownership where
+  toJSON (Single i)  = object ["one"  .= toJSON i]
+  toJSON (Multi  is) = object ["many" .= toJSON is]
 
--}
+instance FromJSON Ownership where
+  parseJSON (Object o) = singleParse <|> multiParse
+    where singleParse = fmap Single $ o .: "one"
+          multiParse  = fmap Multi  $ o .: "many"
+  parseJSON _ = mzero
 
-data EncryptState g k = EncryptState StdGen g (Map Id (Key k))
+data Encrypted a =
+  Encrypted { payload :: ByteString,
+              nonce   :: Nonce,
+              ownedBy :: Ownership }
+  deriving (Eq, Show, Typeable, Generic)
+
+instance ToJSON   (Encrypted a)
+instance FromJSON (Encrypted a)
+
+instance (Arbitrary a, ToJSON a) => Arbitrary (Encrypted a) where
+  arbitrary =
+    do a         <- arbitrary
+       n         <- arbitrary
+       owner     <- arbitrary
+       encKey    <- arbitrary
+       ownership <- elements [Single owner, Multi [encKey]]
+       return $ encryptedAsTypeOf a 
+         Encrypted { payload = encodeS a,
+                     nonce   = n,
+                     ownedBy = ownership }
+    where encryptedAsTypeOf :: a -> Encrypted a -> Encrypted a
+          encryptedAsTypeOf _ e = e
+
+data EncryptError = EncryptError
+                  | OtherEncryptError String
+                  | NoKeys
+                  | NotAuthorized
+                  | PayloadEncodingFailure
+                  | SignatureFailure
+                  | DecodeFailure
+                  deriving (Show, Eq, Ord)
+
+instance Error EncryptError where
+  noMsg  = EncryptError
+  strMsg = OtherEncryptError
 
 -- | A monad transformer for building encryption pipelines and
--- methods.
-newtype EncryptT g k m a =
-  EncryptT (MaybeT (StateT (EncryptState g k) m) a)
-  deriving (Functor, Applicative, Monad, MonadPlus)
+-- methods. Within a single 'EncryptT' session, 'Nonce's are
+-- guaranteed to be randomized and increasing.
+newtype EncryptT m a =
+  EncryptT (ErrorT EncryptError (StateT ([Key], Nonce) m) a)
+  deriving (Functor, Applicative, Monad, MonadPlus, MonadIO)
 
-type EncryptG g k a = EncryptT g k IO a
+instance Monad m => Monoid (EncryptT m a) where
+  mempty = mzero
+  mappend = mplus
 
-type Encrypt k a = EncryptG HashDRBG k a
+-- | A synonym for when the transformer isn't stacked
+type Encrypt a = EncryptT IO a
 
-instance MonadTrans (EncryptT g k) where
+instance MonadTrans EncryptT where
   lift = EncryptT . lift . lift
 
 -- | Attempts to inject an 'Encrypted a' into the 'Encrypt' monad,
 -- using the first included key which can decrypt the value, but fails
 -- otherwise.
-fromEncrypted :: (BlockCipher k, Monad m, CryptoRandomGen g, FromJSON a) =>
-                 Encrypted k a -> EncryptT g k m a
-fromEncrypted e = getKeys >>= justZ . fmap head . mapM (`decrypt` e) 
+fromEncrypted :: Encrypted a -> EncryptT m a
+fromEncrypted = undefined
 
-getKeys :: Monad m => EncryptT g k m [Key k]
-getKeys = do EncryptState _ g0 es <- getEState
-             return (M.elems es)
+errd :: Monad m => EncryptError -> EncryptT m a
+errd = EncryptT . throwError
 
-addKey :: Monad m => Key k -> EncryptT g k m ()
-addKey k@(Key uuid _) =
-  do EncryptState s g es <- getEState
-     putEState (EncryptState s g $ M.insert uuid k es)
+-- | Gets the active keys inside of this 'EncryptT'
+getKeys :: Monad m => EncryptT m [Key]
+getKeys = EncryptT $ liftM fst $ lift get
 
-getEState :: Monad m => EncryptT g k m (EncryptState g k)
-getEState = EncryptT $ lift get
+addKey :: Monad m => Key -> EncryptT m ()
+addKey k = EncryptT $ lift $ modify $ first (k:)
 
-putEState :: Monad m => EncryptState g k -> EncryptT g k m ()
-putEState s = EncryptT $ lift $ put s
+pickKey :: Monad m => Id -> EncryptT m Key
+pickKey i = do keys <- getKeys
+               case find (\k -> identity k == i) keys of
+                 Nothing -> errd NotAuthorized
+                 Just k  -> return k
 
-modCGen :: Monad m => (g -> Maybe (a, g)) -> EncryptT g k m a
-modCGen f = do EncryptState r g0 es <- getEState
-               case f g0 of
-                 Nothing -> nothing
-                 Just (a, g1) -> do
-                   putEState $ EncryptState r g1 es
-                   just a
+removeKey :: Monad m => Key -> EncryptT m ()
+removeKey k = EncryptT $ lift $ modify $ first f
+  where f :: [Key] -> [Key]
+        f = filter (/= k)
 
-getNewCGen :: (Monad m, CryptoRandomGen g) => EncryptT g k m g
-getNewCGen = modCGen (rightMay . splitGen)
+removeKeyById :: Monad m => Id -> EncryptT m ()
+removeKeyById i = EncryptT $ lift $ modify $ first f
+  where f :: [Key] -> [Key]
+        f = filter (\k -> identity k /= i)
 
-modSGen :: Monad m => (StdGen -> (a, StdGen)) -> EncryptT g k m a
-modSGen f = do EncryptState r0 g es <- getEState
-               let (a, r1) = f r0
-               putEState (EncryptState r1 g es)
-               return a
+newKey :: MonadIO m => EncryptT m Key
+newKey = do bs <- liftIO (randomBytes SK.keyLength)
+            i  <- liftIO randomIO
+            return Key { key = SecretKey bs, identity = Id i }
 
-getNewSGen :: (Monad m) => EncryptT g k m StdGen
-getNewSGen = modSGen split
+newNonce :: Monad m => EncryptT m Nonce
+newNonce = do n <- EncryptT $ liftM snd $ lift get
+              EncryptT $ lift $ modify $ second SaltI.incNonce
+              return n
 
-just :: Monad m => a -> EncryptT g k m a
-just = EncryptT . return
+-- | Encrypts a payload using a fresh nonce and a given key
+encrypt :: (Monad m, ToJSON a) => Key -> a -> EncryptT m (Encrypted a)
+encrypt (Key {key = k, identity = i}) a =
+  do n@(Nonce skn) <- newNonce
+     return Encrypted { payload = B64.encode $ SK.encrypt skn (encodeS a) k,
+                        nonce   = n,
+                        ownedBy = Single i }
 
-nothing :: Monad m => EncryptT g k m a
-nothing = EncryptT . MaybeT . return $ Nothing
+-- | Encrypts a payload using all of the currently available keys
+encryptMulti :: (MonadIO m, ToJSON a) => a -> EncryptT m (Encrypted a)
+encryptMulti a = do keys <- getKeys
+                    case keys of
+                      []     -> errd NoKeys
+                      (x:[]) -> encrypt x a
+                      xs     -> do contentKey <- newKey
+                                   enc        <- encrypt contentKey a
+                                   certs      <- mapM (`encrypt` contentKey) xs
+                                   return enc { ownedBy = Multi certs }
 
-newIvec :: (Monad m, BlockCipher k, CryptoRandomGen g) => EncryptT g k m (Ivec k)
-newIvec = getNewCGen >>= rightZ . fmap (Ivec . fst) . getIV
+decrypt :: (Monad m, FromJSON a) => Encrypted a -> EncryptT m a
+decrypt (Encrypted { ownedBy = o,
+                     nonce = Nonce skn,
+                     payload = p }) =
+  case o of
+    Single i    -> do (Key { key = sk }) <- pickKey i
+                      decrypt' sk
+    Multi encks -> do (Key { key = sk }) <- mconcat $ map decrypt encks
+                      decrypt' sk
+  where decrypt' sk =
+          do pl <- (rightZ $ B64.decode p)      <> errd PayloadEncodingFailure
+             s  <- justZ (SK.decrypt skn pl sk) <> errd SignatureFailure
+             a  <- justZ (decodeS s)            <> errd DecodeFailure
+             return a
 
--- | Creates a new cryptographic key
-newKey :: (CryptoRandomGen g, BlockCipher k, Monad m) => EncryptT g k m (Key k)
-newKey = do let len = keyLength
-            bytes <- modCGen (rightMay . genBytes (untag len `div` 8))
-            key   <- justZ $ buildKey bytes
-            uuid  <- modSGen random
-            return (Key (Id uuid) (key `asTaggedTypeOf` len))
+-- | Runs an 'EncryptT'
+performEncrypt :: MonadIO m => EncryptT m a -> m (Either EncryptError a)
+performEncrypt (EncryptT m) =
+  do n <- liftIO SaltI.createRandomNonce
+     evalStateT (runErrorT m) ([], n)
 
--- | Encrypt a value outside of an 'Encrypt' context
-encrypt' :: (BlockCipher k, ToJSON a) => Key k -> Ivec k -> a -> Payload k
-encrypt' (Key id k) (Ivec iv) a = Payload $ fst $ cbc' k iv bytes
-  where bytes = padBlockSize k $ mconcat $ L.toChunks $ compress $ encode a
-
-decrypt' :: (BlockCipher k, FromJSON a) =>
-            Key k -> Ivec k -> Payload k -> Maybe a
-decrypt' (Key id k) (Ivec iv) (Payload bs) =
-  do msg <- unpadPKCS5safe out
-     decode $ decompress $ L.fromChunks [msg]  
-  where (out, _) = unCbc' k iv bs
-
--- | Encrypt a value in the current 'Encrypt' context using a single
--- particular key
-encryptOnce :: (BlockCipher k, Monad m, ToJSON a, CryptoRandomGen g) =>
-               a -> Key k -> EncryptT g k m (Encrypted k a)
-encryptOnce a key@(Key id k) =
-  do ivec@(Ivec iv) <- newIvec
-     return Encrypted { ivec    = ivec,
-                        keys    = Keymap (Left id),
-                        payload = encrypt' key ivec a }
-
--- | Encrypt a value in the current 'Encrypt' context
-encrypt :: (ToJSON a, BlockCipher k, Monad m, CryptoRandomGen g) =>
-           a -> EncryptT g k m (Encrypted k a)
-encrypt a = do contentIvec          <- newIvec
-               contentKey           <- newKey
-               keys                 <- getKeys
-               encryptedContentKeys <- mapM (encryptOnce contentKey) keys
-               return Encrypted { ivec    = contentIvec,
-                                  keys    = makeKeymap keys encryptedContentKeys,
-                                  payload = encrypt' contentKey contentIvec a }
-  where makeKeymap :: [Key k] -> [Encrypted k (Key k)] -> Keymap k
-        makeKeymap keys encs = Keymap $ Right $ M.fromList $ zipWith go keys encs
-        go :: Key k -> Encrypted k (Key k) -> (Id, Encrypted k (Key k))
-        go (Key id _) e = (id, e)
-
-performEncryptT :: (CryptoRandomGen g, Monad m, MonadPlus m) =>
-                   StdGen -> g -> EncryptT g k m a -> m a
-performEncryptT sg rg (EncryptT m) =
-  evalStateT (runMaybeT m) (EncryptState sg rg M.empty) >>= justZ
-                          
-performEncryptTIO :: CryptoRandomGen g => EncryptT g k IO a -> IO a
-performEncryptTIO e =
-  do sg <- getStdGen
-     rg <- newGenIO
-     performEncryptT sg rg e
-                                   
--- Serialization instances: JSON
-
-instance FromJSON Id where
-  parseJSON (String s) = fmap Id $ justZ $ fromString $ T.unpack s
-  parseJSON _          = fail "parse: Data.Encrypted.JSON UUID"
-
-instance ToJSON Id where
-  toJSON (Id uuid) = String . T.pack . toString $ uuid
-
--- | A helper function which serializes any serializable value into a
--- JSON String
-textFromSerializable :: Serialize a => a -> Text
-textFromSerializable = E.decodeUtf8 . B64.encode . S.encode
-
--- | The inverse function of 'stringFromSerializable'
-serializableFromText :: (Serialize a, MonadPlus m) => Text -> m a
-serializableFromText t =
-  rightZ . (S.decode <=< B64.decode) . E.encodeUtf8 $ t
-
-instance BlockCipher k => ToJSON (Key k) where
-  toJSON (Key id k) = object ["key" .= (String $ textFromSerializable k),
-                              "id"  .= toJSON id]
-
-instance BlockCipher k => FromJSON (Key k) where
-  parseJSON (Object o) = do
-    key <- (o .: "key") >>= serializableFromText
-    id  <- o .: "id"
-    return (Key id key)
-
-instance BlockCipher k => ToJSON (Ivec k) where
-  toJSON (Ivec iv) = String $ textFromSerializable iv
-
-instance BlockCipher k => FromJSON (Ivec k) where
-  parseJSON (String s) = serializableFromText s
-
-instance BlockCipher k => ToJSON (Payload k) where
-  toJSON (Payload bs) = String . E.decodeUtf8 . B64.encode $ bs
-
-instance BlockCipher k => FromJSON (Payload k) where
-  parseJSON (String s) = fmap Payload $ rightZ $ B64.decode $ E.encodeUtf8 s
-  parseJSON _          = fail "parse: Data.Encrypted.JSON Payload"
-
-instance BlockCipher k => ToJSON (Keymap k) where
-  toJSON (Keymap (Left id)) =
-    object ["owner" .= toJSON id]
-  toJSON (Keymap (Right m)) = object [("keys", object $ pairs m)]
-    where pairs :: BlockCipher k => Map Id (Encrypted k (Key k)) -> [(Text, Value)]
-          pairs = map (toText *** toJSON) . M.toList
-          toText :: Id -> Text
-          toText id = let (String s) = toJSON id in s
-          
--- | Traverses on the map as a list, so it could be faster if it were
--- in-place instead of having to deconstruct and rebuild the map
--- through an intermediary
-instance BlockCipher k => FromJSON (Keymap k) where
-  parseJSON v = objParse v single <|> objParse v multi
-    where objParse :: Value -> (Object -> Parser a) -> Parser a
-          objParse (Object o) f = f o
-          objParse _          _ = fail "parse Data.Encrypted.Keymap not an object"
-          -- | Parse a single type Keymap
-          single   :: BlockCipher k => Object -> Parser (Keymap k)
-          single o = do
-            id <- o .: "owner"
-            return $ Keymap $ Left id
-          -- | Parse a multi type Keymap
-          multi    :: BlockCipher k => Object -> Parser (Keymap k)
-          multi o = do
-            keys <- o .: "keys"
-            pairs <- mapM (runKleisli doKey) keys
-            return $ Keymap $ Right $ M.fromList pairs
-            where doKey :: BlockCipher k =>
-                           Kleisli Parser (Text, Value) (Id, Encrypted k (Key k))
-                  doKey = Kleisli (parseJSON . String)
-                          ***
-                          Kleisli parseJSON
-
-instance (ToJSON a, BlockCipher k) => ToJSON (Encrypted k a) where
-  toJSON (Encrypted { ivec, keys, payload }) =
-    object [ "ivec"    .= (String $ textFromSerializable ivec),
-             "keys"    .= toJSON keys,
-             "payload" .= (String $ textFromSerializable payload) ]
-                   
-instance (FromJSON a, BlockCipher k) => FromJSON (Encrypted k a) where
-  parseJSON (Object o) = do
-    ivec    <- o .: "ivec" >>= serializableFromText
-    keys    <- o .: "keys"
-    payload <- o .: "payload" >>= serializableFromText
-    return Encrypted { ivec = ivec,
-                       keys = keys,
-                       payload = payload }
-  parseJSON _ = fail "parse: Data.Encrypted FromJSON Encrypted"
+-- | Like 'performEncrypt' but just passes failure into the base monad
+performEncrypt' :: (MonadIO m, MonadPlus m) => EncryptT m a -> m a
+performEncrypt' e = performEncrypt e >>= rightZ
 
 
--- -- Arbitrary instances
+-- Tests
 
-genDRBG :: Gen HashDRBG
-genDRBG = do ent <- vector $ unTagged (genSeedLength :: Tagged HashDRBG Int)
-             let Right g = newGen (B.pack ent)
-             return g
+instance Arbitrary ByteString where
+  arbitrary = B.pack `fmap` arbitrary
 
-performEncryptGen :: MonadPlus m => EncryptT HashDRBG k m a -> Gen (m a)
-performEncryptGen m = do sg <- MkGen (\s _ -> s)
-                         rg <- genDRBG
-                         return $ performEncryptT sg rg m
-
--- | Newtype entirely to form the Arbitrary instance
-newtype Pair k a = P { unPair :: (Key k, Encrypted k a) }
-
-instance (BlockCipher k, Arbitrary a, ToJSON a) => Arbitrary (Pair k a) where
-  arbitrary = do a  <- arbitrary
-                 fmap fromJust $ performEncryptGen (mkpair a)
-    where mkpair a = do key <- newKey
-                        addKey key
-                        enc <- encrypt a
-                        return $ P (key, enc)
-
-instance BlockCipher k => Arbitrary (Key k) where
-  arbitrary = fmap fromJust $ performEncryptGen newKey
-
-instance BlockCipher k => Arbitrary (Ivec k) where
-  arbitrary = fmap fromJust $ performEncryptGen newIvec
-
-instance BlockCipher k => Arbitrary (Payload k) where
-  arbitrary = fmap (Payload . B8.pack) arbitrary
-
-instance (BlockCipher k, Arbitrary a, ToJSON a) => Arbitrary (Encrypted k a) where
-  arbitrary = fmap (snd . unPair) arbitrary
-
--- | Lifts 'UUID's 'Random' instance
-instance Arbitrary Id where
-  arbitrary = MkGen $ \g _ -> Id $ fst $ random g
-
---- Tests
+instance Arbitrary Text where
+  arbitrary = T.pack `fmap` arbitrary
 
 data Wrapper a = Wrapper { unWrap :: a } deriving (Show, Eq, Generic)
 
@@ -472,35 +333,35 @@ instance Arbitrary a => Arbitrary (Wrapper a) where
 instance ToJSON a => ToJSON (Wrapper a)
 instance FromJSON a => FromJSON (Wrapper a)
 
-prop_jsonCanDecode :: (FromJSON a, ToJSON a, Eq a) => a -> a -> Bool
-prop_jsonCanDecode witness a =
-  case decode (encode $ Wrapper $ a `asTypeOf` witness) of
-    Nothing          -> False
-    Just (Wrapper b) -> (b `asTypeOf` a) `seq` True
+-- | Only the left inverse is meaningful since the other inverse
+-- doesn't have all of 'Text' as its domain, only valid base 64
+-- strings!
+prop_b64textLeftInv :: ByteString -> Bool
+prop_b64textLeftInv bs = Just bs == unb64text (b64text bs)
 
-prop_encryptLeftIso' :: (ToJSON a, FromJSON a, Eq a, BlockCipher k)
-                        => k -> a -> Key k -> Ivec k -> a -> Bool
-prop_encryptLeftIso' keyWitness aWitness key iv a =
-  case decrypt' key iv (encrypt' key iv a) of
-    Nothing -> False
-    Just b  -> a == b
-
-prop_encryptLeftIso :: (ToJSON a, FromJSON a, Eq a, BlockCipher k)
-                        => k -> a -> a -> Gen Bool
-prop_encryptLeftIso keyWitness aWitness a =
-  fmap justBool . performEncryptGen $
-  do key@(Key _ k) <- newKey
-     let _ = k `asTypeOf` keyWitness
-     addKey key
-     e <- encrypt a
-     b <- fromEncrypted e
-     return (b == a)
-  where justBool Nothing  = False
-        justBool (Just b) = b
-
--- * Encrypted k a FAILS this, thus we can't even test encryption
 prop_jsonLeftIso :: (FromJSON a, ToJSON a, Eq a) => a -> a -> Bool
 prop_jsonLeftIso witness a =
   case decode (encode $ Wrapper $ a `asTypeOf` witness) of
     Nothing          -> False
     Just (Wrapper b) -> a == b
+
+prop_jsonLeftIsoId :: Id -> Bool
+prop_jsonLeftIsoId = prop_jsonLeftIso (undefined :: Id)
+
+prop_jsonLeftIsoKey :: Key -> Bool
+prop_jsonLeftIsoKey = prop_jsonLeftIso (undefined :: Key)
+
+prop_jsonLeftIsoNonce :: Nonce -> Bool
+prop_jsonLeftIsoNonce = prop_jsonLeftIso (undefined :: Nonce)
+
+prop_jsonLeftIsoEncrypted :: Encrypted Int -> Bool
+prop_jsonLeftIsoEncrypted = prop_jsonLeftIso (undefined :: Encrypted Int)
+
+qc :: IO ()
+qc = sequence_ [
+  quickCheck prop_b64textLeftInv,
+  quickCheck prop_jsonLeftIsoId,
+  quickCheck prop_jsonLeftIsoKey,
+  quickCheck prop_jsonLeftIsoNonce,
+  quickCheck prop_jsonLeftIsoEncrypted
+  ]
