@@ -174,15 +174,13 @@ instance FromJSON (Encrypted a)
 
 instance (Arbitrary a, ToJSON a) => Arbitrary (Encrypted a) where
   arbitrary =
-    do a         <- arbitrary
-       n         <- arbitrary
-       owner     <- arbitrary
-       encKey    <- arbitrary
-       ownership <- elements [Single owner, Multi [encKey]]
+    do a                              <- arbitrary
+       n@(Nonce skn)                  <- arbitrary
+       (Key { key = k, identity = i}) <- arbitrary
        return $ encryptedAsTypeOf a 
-         Encrypted { payload = encodeS a,
+         Encrypted { payload = B64.encode $ SK.encrypt skn (encodeS a) k,
                      nonce   = n,
-                     ownedBy = ownership }
+                     ownedBy = Single i }
     where encryptedAsTypeOf :: a -> Encrypted a -> Encrypted a
           encryptedAsTypeOf _ e = e
 
