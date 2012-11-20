@@ -31,19 +31,18 @@ module Data.Encrypted (
   encrypt, encryptMulti, decrypt
   ) where
 
+import Data.Encrypted.Internal
+
 import Data.UUID
 import Data.Aeson
 import Data.Tagged
 import Data.Maybe
 import Data.Monoid
 import Data.List
-import           Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as TE
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
-import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Base64 as B64
 
 import GHC.Generics
@@ -100,11 +99,6 @@ instance Show Key where
     showParen (p>0) $
     showString $ "Key {key = <<elided>>, identity = " ++ show i ++ "}"
 
-b64text :: ByteString -> Text
-b64text = TE.decodeUtf8 . B64.encode
-
-unb64text :: Text -> Maybe ByteString
-unb64text = rightMay . B64.decode . TE.encodeUtf8
 
 instance ToJSON Key where
   toJSON (Key { key = SecretKey kbs, identity = i }) =
@@ -155,14 +149,6 @@ instance Arbitrary Nonce where
     do let size = SaltI.size
        n <- fmap (fromJust . SaltI.fromBS . B.pack) (vector $ untag size)
        return (n `asTaggedTypeOf` size)
-
--- | Strict JSON encode
-encodeS :: ToJSON a => a -> ByteString
-encodeS = mconcat . BL.toChunks . encode
-
--- | Strict JSON decode
-decodeS :: FromJSON a => ByteString -> Maybe a
-decodeS = decode . BL.fromChunks . return
 
 data Ownership = Single Id | Multi [Encrypted Key]
                deriving (Show, Eq, Typeable, Generic)
@@ -315,53 +301,3 @@ performEncrypt (EncryptT m) =
 -- | Like 'performEncrypt' but just passes failure into the base monad
 performEncrypt' :: (MonadIO m, MonadPlus m) => EncryptT m a -> m a
 performEncrypt' e = performEncrypt e >>= rightZ
-
-
--- Tests
-
-instance Arbitrary ByteString where
-  arbitrary = B.pack `fmap` arbitrary
-
-instance Arbitrary Text where
-  arbitrary = T.pack `fmap` arbitrary
-
-data Wrapper a = Wrapper { unWrap :: a } deriving (Show, Eq, Generic)
-
-instance Arbitrary a => Arbitrary (Wrapper a) where
-  arbitrary = fmap Wrapper arbitrary
-
-instance ToJSON a => ToJSON (Wrapper a)
-instance FromJSON a => FromJSON (Wrapper a)
-
--- | Only the left inverse is meaningful since the other inverse
--- doesn't have all of 'Text' as its domain, only valid base 64
--- strings!
-prop_b64textLeftInv :: ByteString -> Bool
-prop_b64textLeftInv bs = Just bs == unb64text (b64text bs)
-
-prop_jsonLeftIso :: (FromJSON a, ToJSON a, Eq a) => a -> a -> Bool
-prop_jsonLeftIso witness a =
-  case decode (encode $ Wrapper $ a `asTypeOf` witness) of
-    Nothing          -> False
-    Just (Wrapper b) -> a == b
-
-prop_jsonLeftIsoId :: Id -> Bool
-prop_jsonLeftIsoId = prop_jsonLeftIso (undefined :: Id)
-
-prop_jsonLeftIsoKey :: Key -> Bool
-prop_jsonLeftIsoKey = prop_jsonLeftIso (undefined :: Key)
-
-prop_jsonLeftIsoNonce :: Nonce -> Bool
-prop_jsonLeftIsoNonce = prop_jsonLeftIso (undefined :: Nonce)
-
-prop_jsonLeftIsoEncrypted :: Encrypted Int -> Bool
-prop_jsonLeftIsoEncrypted = prop_jsonLeftIso (undefined :: Encrypted Int)
-
-qc :: IO ()
-qc = sequence_ [
-  quickCheck prop_b64textLeftInv,
-  quickCheck prop_jsonLeftIsoId,
-  quickCheck prop_jsonLeftIsoKey,
-  quickCheck prop_jsonLeftIsoNonce,
-  quickCheck prop_jsonLeftIsoEncrypted
-  ]
