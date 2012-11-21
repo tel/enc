@@ -51,6 +51,7 @@ test-suite tests
     aeson,
     attoparsec,
     bytestring,
+    base64-bytestring,
     test-framework,
     test-framework-quickcheck2,
     text,

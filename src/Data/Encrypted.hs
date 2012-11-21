@@ -18,11 +18,12 @@ Portability : non-portable
 -}
 
 module Data.Encrypted (
-  Id        (..),
-  Key       (..),
-  Nonce     (..),
-  Ownership (..),
-  Encrypted (..),
+  Id           (..),
+  Key          (..),
+  Nonce        (..),
+  Ownership    (..),
+  Encrypted    (..),
+  EncryptError (..),
   EncryptT, performEncrypt, performEncrypt',
   Encrypt,
   fromEncrypted,
