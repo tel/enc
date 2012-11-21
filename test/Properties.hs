@@ -129,7 +129,9 @@ tests = [
 
   testGroup "attacks" [
     testProperty "tampering" $ prop_signatureCheck (undefined :: Wrapper Int),
-    testProperty "independent nonce collision" prop_newNonceCollisions,
-    testProperty "internal nonce collision" prop_internalNonceCollisions
+    testGroup "nonce collision" [
+      testProperty "independent" prop_newNonceCollisions,
+      testProperty "internal" prop_internalNonceCollisions
+      ]
     ]
   ]
