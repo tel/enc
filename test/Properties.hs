@@ -14,8 +14,8 @@ import qualified Data.ByteString.Base64 as B64
 
 import GHC.Generics
 
-import Test.Framework (Test, defaultMain, testGroup)
-import Test.Framework.Providers.QuickCheck2 (testProperty)
+import Test.Framework
+import Test.Framework.Providers.QuickCheck2
 import Test.QuickCheck
 import Test.QuickCheck.Monadic
 
@@ -46,6 +46,14 @@ ladj_json _ a =
   case decode (encode $ Wrapper a) of
     Nothing          -> False
     Just (Wrapper b) -> a == b
+
+radj_json :: (FromJSON a, ToJSON a, Eq a, Show a) => a -> a -> Bool
+radj_json _ a =
+  let enca = encode $ Wrapper a
+      a'   = decode enca `asTypeOf` Just (Wrapper a)
+  in case fmap encode a' of
+    Nothing -> False
+    Just bs -> enca == bs
 
 ladj_encrypt :: (Eq a, ToJSON a, FromJSON a) => a -> a -> Property
 ladj_encrypt _ a =
@@ -106,11 +114,19 @@ tests = [
   testGroup "adjunctions" [
      testProperty "left b64text" ladj_b64text,
 
-     testGroup "left JSON" [
-       testProperty "Id" $ ladj_json (undefined :: Id),
-       testProperty "Key" $ ladj_json (undefined :: Key),
-       testProperty "Nonce" $ ladj_json (undefined :: Nonce),
-       testProperty "Encrypted" $ ladj_json (undefined :: Encrypted (Encrypted Int))
+     testGroup "JSON" [
+       testGroup "left" [
+          testProperty "Id" $ ladj_json (undefined :: Id),
+          testProperty "Key" $ ladj_json (undefined :: Key),
+          testProperty "Nonce" $ ladj_json (undefined :: Nonce),
+          testProperty "Encrypted" $ ladj_json (undefined :: Encrypted (Encrypted Int))
+          ],
+       testGroup "right" [
+          testProperty "Id" $ radj_json (undefined :: Id),
+          testProperty "Key" $ radj_json (undefined :: Key),
+          testProperty "Nonce" $ radj_json (undefined :: Nonce),
+          testProperty "Encrypted" $ radj_json (undefined :: Encrypted (Encrypted Int))
+          ]
        ],
      
      testGroup "left Encrypt" [
