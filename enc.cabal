@@ -49,13 +49,11 @@ test-suite tests
     ghc-prim,
     QuickCheck,
     aeson,
-    attoparsec,
     bytestring,
     base64-bytestring,
     test-framework,
     test-framework-quickcheck2,
-    text,
-    time
+    text
 
 source-repository head
   type:     git
